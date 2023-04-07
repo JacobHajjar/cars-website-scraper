@@ -1,6 +1,8 @@
 '''scrape used car data of common car makes from cars.com'''
+from math import ceil
 from re import sub
-from requests import get
+from csv import writer
+from requests import get, exceptions
 from bs4 import BeautifulSoup
 
 __author__ = 'Jacob Hajjar'
@@ -48,24 +50,34 @@ def scrape_car_page(make, model_list, car_tag):
     '''scrape the data from the car's page from tag and populate the dict to be returned,
     or return none if any of the values could not be populated'''
     car_url = "https://www.cars.com" + car_tag.get('href')
+    print(car_url)
     response = get(car_url)
+    try:
+        response = get(car_url)
+    except exceptions.ConnectionError:  # This is the correct syntax
+        print("could not get car page")
+        return None
     soup = BeautifulSoup(response.content, 'html.parser')
     # create dict to define the order and properties of a car
     car = {'year': None, 'make': None, 'model': None, 'trim': None, 'exterior_color': None,
            'interior_color': None, 'drivetrain': None, 'fuel_type': None, 'transmission': None,
-           'mileage': None, 'in_accident': None, '1_owner': None, 'personal_used': None}
+           'mileage': None, 'in_accident': None, '1_owner': None, 'personal_used': None, 'price': None}
     # get the car title as a list of each word
-    car_title = soup.find('h1', class_='listing-title').string.split()
+
     # get and validate the year from the car title
     try:
+        car_title = soup.find('h1', class_='listing-title').string.split()
         year = int(car_title[0])
         if 1950 < year < 2023:
             car['year'] = year
             car_title.pop(0)
         else:
             return None
-    except ValueError:
-        print("invalid year retrieved")
+    except (ValueError, AttributeError) as error:
+        if error == ValueError:
+            print("invalid year retrieved")
+        else:
+            print("could not retrieve title")
         return None
     # get make by matching the make inside the title
     make_list = make.split()
@@ -106,25 +118,44 @@ def scrape_car_page(make, model_list, car_tag):
     car['1_owner'] = get_car_attribute(soup, '1-owner vehicle')
     # get if the car was personally used or not (business used)
     car['personal_used'] = get_car_attribute(soup, 'Personal use only')
-    # check no entries are none and write to csv file
-    if not all(car.values()):
+    # lastly get the price TODO
+    price_string = soup.find(
+        'header', class_='gallery-header').find('span', class_='primary-price').string
+    try:
+        car['price'] = int(sub('[^0-9]', '', price_string))
+    except ValueError:
+        print("price could not be initialized")
+    if None in car.values():
+        print("car not initialized with all attributes")
         return None
     print(car)
-    print(car_url)
-    return car
+    return car.values()
 
 
-def scrape_car_make(make):
-    '''scrape the car data of the current make'''
+def scrape_car_make_page(make, model_list, file_name, soup):
+    '''scrape a single page of the car make'''
+    car_tag_list = soup.find_all(
+        'a', class_='image-gallery-link vehicle-card-visited-tracking-link')
+    with open(file_name, 'a', newline='', encoding="utf-8") as file:
+        data_writer = writer(file)
+        number_of_car = 1
+        for car_tag in car_tag_list:
+            number_of_car += 1
+            car_data = scrape_car_page(make, model_list, car_tag)
+            if car_data:
+                data_writer.writerow(car_data)
+            else:
+                continue
+
+
+def scrape_car_make(make, file_name):
+    '''scrape the car data of the current make from all pages'''
     url = 'https://www.cars.com/shopping/results/'
     cars_per_page = 100
-    car_type = {'page_size': cars_per_page, 'stock_type': 'used',
-                'makes': make.replace(" ", "_"), 'zip': '92801'}
-    response = get(url, params=car_type)
+    page_parameters = {'page': 1, 'page_size': cars_per_page, 'stock_type': 'used',
+                       'makes': make.replace(" ", "_"), 'zip': '92801'}
+    response = get(url, params=page_parameters)
     soup = BeautifulSoup(response.content, 'html.parser')
-    # f = open("page.html", "a")
-    # f.write(str(response.content))
-    # f.close()
 
     # find the section containing text of the current models
     models = soup.find(string=make + " models")
@@ -137,29 +168,40 @@ def scrape_car_make(make):
         if model_text not in model_list:
             model_list.append(model_text)
     print(model_list)
-    # get the number of listings
-    listings = soup.find('span', class_='total-filter-count')
-    print(listings.string)
-    # get number of pages
+    # get the number of listings and calculate the pages
+    listings_string = soup.find(
+        'span', class_='total-filter-count').string.split()[0]
+    print(listings_string)
+    num_pages = 0
+    try:
+        num_listings = int(sub('[^0-9]', '', listings_string))
+        num_pages = ceil(num_listings / cars_per_page)
+        print(num_pages)
+    except ValueError:
+        print("could not get number of listings for " + make)
+        return
     # scrape all the cars on the page
-    car_tag_list = soup.find_all(
-        'a', class_='image-gallery-link vehicle-card-visited-tracking-link')
-    for car_tag in car_tag_list:
-        scrape_car_page(make, model_list, car_tag)
+    scrape_car_make_page(make, model_list, file_name, soup)
+    for page_num in range(2, num_pages + 1):
+        page_parameters['page'] = page_num
+        print("scraping page " + str(page_num))
+        response = get(url, params=page_parameters)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        scrape_car_make_page(make, model_list, file_name, soup)
 
 
-def get_cars_data(file):
+def get_cars_data(file_name):
     '''get the various car attributes from the given url and append it to the file'''
-    # TODO get the list of popular makes from cars.com
-    current_make = 'Land Rover'
-    scrape_car_make(current_make)
+    url = 'https://www.cars.com/'
+    response = get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+    popular_makes_tag = soup.find('optgroup', label='Popular makes').find_all('option')
+    for popular_make_tag in popular_makes_tag:
+        scrape_car_make(popular_make_tag.string, file_name)
 
 
 def main():
     '''the main function'''
-
-    # url = 'https://www.cars.com/shopping/results/?dealer_id=&keyword=&list_price_max=70000&list_price_min=&makes[]=&maximum_distance=all&mileage_max=&page_size=20&sort=best_match_desc&stock_type=used&year_max=&year_min=&zip=92801'
-
     get_cars_data('used_cars.csv')
 
 
